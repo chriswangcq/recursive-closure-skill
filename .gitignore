@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.complex-problems/
+.pytest_cache/
+state.json.lock
+state.json.tmp.*
