@@ -10,13 +10,18 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
-import fcntl
 import json
 import os
 import re
 import sys
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl
+    _HAS_FCNTL = True
+except ImportError:
+    _HAS_FCNTL = False
 
 
 SCHEMA_VERSION = 6
@@ -126,6 +131,36 @@ EFFORT_HINTS = {
     },
 }
 
+ERROR_MESSAGES = {
+    "unknown_problem": {"en": "Unknown problem: {id}", "zh": "未知问题: {id}"},
+    "unknown_ticket": {"en": "Unknown ticket: {id}", "zh": "未知工单: {id}"},
+    "unknown_ledger": {"en": "Unknown ledger under {root}: {id}", "zh": "{root} 下未找到台账: {id}"},
+    "illegal_transition": {"en": "Illegal {kind} transition for {id}: {old} -> {new}", "zh": "{id} 的{kind}状态转换不合法: {old} -> {new}"},
+    "problem_must_be_doing": {"en": "Problem {id} must be doing before recording a ticket result", "zh": "问题 {id} 必须处于 doing 状态才能记录工单结果"},
+    "cannot_record_result": {"en": "Cannot record result for ticket {tid} while problem {pid} is {status}", "zh": "问题 {pid} 处于 {status} 状态时不能为工单 {tid} 记录结果"},
+    "ticket_must_be_defined": {"en": "Ticket {id} must be defined before classification; current status is {status}", "zh": "工单 {id} 必须先定义才能分类；当前状态: {status}"},
+    "problem_already_has_ticket": {"en": "Problem {id} already has a ticket: {tid}", "zh": "问题 {id} 已有工单: {tid}"},
+    "set_status_problem_only_doing": {"en": "Public set-status for problems only allows doing; use check to write checking/done/followup/blocked outcomes", "zh": "公开的 set-status 仅允许设置问题为 doing；使用 check 写入 checking/done/followup/blocked"},
+    "set_status_ticket_only_executing_splitting": {"en": "Public set-status for tickets only allows executing or splitting; use result to mark tickets done", "zh": "公开的 set-status 仅允许设置工单为 executing 或 splitting；使用 result 标记工单完成"},
+    "no_ledgers_found": {"en": "No ledgers found under {root}", "zh": "{root} 下未找到台账"},
+    "ledger_valid": {"en": "Ledger is valid!", "zh": "台账验证通过！"},
+    "children_still_open": {"en": "Cannot finish ticket {tid}; child problems still open: {children}", "zh": "工单 {tid} 无法完成；子问题仍未关闭: {children}"},
+    "split_no_children": {"en": "Cannot finish split ticket {tid}; create at least one child problem first", "zh": "拆分工单 {tid} 无法完成；请先创建至少一个子问题"},
+}
+
+_current_language = "en"
+
+
+def set_language(lang: str) -> None:
+    global _current_language
+    _current_language = lang
+
+
+def err_msg(key: str, **kwargs: Any) -> str:
+    msgs = ERROR_MESSAGES.get(key, {})
+    template = msgs.get(_current_language, msgs.get("en", key))
+    return template.format(**kwargs)
+
 
 def effort_hint(action: str, effort: str) -> str:
     hints = EFFORT_HINTS.get(action)
@@ -140,7 +175,16 @@ def now_iso() -> str:
 
 def slugify(text: str, limit: int = 48) -> str:
     text = text.lower()
-    text = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "-", text).strip("-")
+    text = re.sub(
+        r"[^a-z0-9"
+        r"\u4e00-\u9fff"
+        r"\u3400-\u4dbf"
+        r"\u3040-\u309f"
+        r"\u30a0-\u30ff"
+        r"\uac00-\ud7af"
+        r"\U00020000-\U0002a6df"
+        r"]+", "-", text
+    ).strip("-")
     return (text[:limit].strip("-") or "item")
 
 
@@ -148,7 +192,7 @@ def next_id(state: dict[str, Any], prefix: str) -> str:
     key = {"P": "problem", "T": "ticket", "R": "result", "C": "check", "E": "event"}[prefix]
     value = state["counters"].get(key, 0)
     state["counters"][key] = value + 1
-    return f"{prefix}{value:03d}"
+    return f"{prefix}{value:0{max(3, len(str(value)))}d}"
 
 
 def ledger_id() -> str:
@@ -289,6 +333,9 @@ def load_state(ledger: Path) -> dict[str, Any]:
         version = state.get("schema_version")
         raise SystemExit(f"Unsupported ledger schema_version {version}; this script only supports schema_version {SCHEMA_VERSION}")
     state.pop("status", None)
+    lang = state.get("language", "en")
+    if lang and lang != "en":
+        set_language(lang)
     return state
 
 
@@ -304,14 +351,29 @@ def save_state(ledger: Path, state: dict[str, Any]) -> None:
 
 @contextlib.contextmanager
 def locked_state(ledger: Path):
-    """Acquire an exclusive file lock, then yield (state, save) for the caller
-    to read, modify, and persist state.json atomically."""
+    """Acquire an exclusive file lock, then yield state for the caller
+    to read and modify. State is saved only if the block succeeds."""
     lock_path = ledger / "state.json.lock"
-    with lock_path.open("w") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
+    if _HAS_FCNTL:
+        with lock_path.open("w") as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            state = load_state(ledger)
+            success = False
+            try:
+                yield state
+                success = True
+            finally:
+                if success:
+                    save_state(ledger, state)
+    else:
         state = load_state(ledger)
-        yield state
-        save_state(ledger, state)
+        success = False
+        try:
+            yield state
+            success = True
+        finally:
+            if success:
+                save_state(ledger, state)
 
 
 def append_event(ledger: Path, state: dict[str, Any], event_type: str, payload: dict[str, Any]) -> str:
@@ -334,7 +396,7 @@ def transition_problem(ledger: Path, state: dict[str, Any], problem_id: str, sta
     if old == status:
         return
     if status not in PROBLEM_TRANSITIONS.get(old, set()):
-        raise SystemExit(f"Illegal problem transition for {problem_id}: {old} -> {status}")
+        raise SystemExit(err_msg("illegal_transition", kind="problem", id=problem_id, old=old, new=status))
     problem["status"] = status
     problem["updated_at"] = now_iso()
     append_event(ledger, state, "problem_status_changed", {"id": problem_id, "from": old, "to": status})
@@ -839,11 +901,11 @@ def set_status_cmd(args: argparse.Namespace) -> None:
             raise SystemExit(f"Unknown {args.kind}: {args.id}")
         if args.kind == "problem":
             if args.status != "doing":
-                raise SystemExit("Public set-status for problems only allows doing; use check to write checking/done/followup/blocked outcomes")
+                raise SystemExit(err_msg("set_status_problem_only_doing"))
             transition_problem(ledger, state, args.id, args.status)
         else:
             if args.status not in {"executing", "splitting"}:
-                raise SystemExit("Public set-status for tickets only allows executing or splitting; use result to mark tickets done")
+                raise SystemExit(err_msg("set_status_ticket_only_executing_splitting"))
             transition_ticket(ledger, state, args.id, args.status)
     render(ledger, state)
     update_workspace_index_for_ledger(ledger)
@@ -864,13 +926,13 @@ def result_cmd(args: argparse.Namespace) -> None:
         raise SystemExit("result body missing: ## Summary")
     with locked_state(ledger) as state:
         if args.ticket not in state["tickets"]:
-            raise SystemExit(f"Unknown ticket: {args.ticket}")
+            raise SystemExit(err_msg("unknown_ticket", id=args.ticket))
         ticket = state["tickets"][args.ticket]
         problem = state["problems"][ticket["problem_id"]]
         if problem["status"] == "todo":
-            raise SystemExit(f"Problem {problem['id']} must be doing before recording a ticket result")
+            raise SystemExit(err_msg("problem_must_be_doing", id=problem['id']))
         if problem["status"] in {"done", "blocked"}:
-            raise SystemExit(f"Cannot record result for ticket {args.ticket} while problem {problem['id']} is {problem['status']}")
+            raise SystemExit(err_msg("cannot_record_result", tid=args.ticket, pid=problem['id'], status=problem['status']))
         if ticket["status"] == "classified":
             if ticket.get("classification") == "one_go":
                 transition_ticket(ledger, state, args.ticket, "executing")
@@ -1671,6 +1733,29 @@ def validate(ledger: Path, state: dict[str, Any] | None = None) -> list[str]:
         if not c.get("body_path") or not (ledger / c["body_path"]).exists():
             errors.append(f"{cid} missing body file {c.get('body_path')}")
 
+    counters = state.get("counters", {})
+    for prefix, key in [("P", "problem"), ("T", "ticket"), ("R", "result"), ("C", "check")]:
+        expected = len(state.get(f"{key}s", {}))
+        actual = counters.get(key, 0)
+        if actual < expected:
+            errors.append(f"Counter '{key}' is {actual} but {expected} {key}s exist")
+
+    iso_re = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?([+-]\d{2}:\d{2}|Z)$")
+    for collection_name in ("problems", "tickets", "results", "checks"):
+        for eid, entity in state.get(collection_name, {}).items():
+            for ts_field in ("created_at", "updated_at"):
+                ts = entity.get(ts_field)
+                if ts and not iso_re.match(ts):
+                    errors.append(f"{eid} has invalid ISO timestamp in {ts_field}: {ts}")
+
+    for pid, p in state["problems"].items():
+        body_path = p.get("body_path")
+        if body_path and (ledger / body_path).exists():
+            body_text = (ledger / body_path).read_text(encoding="utf-8")
+            heading = first_heading(body_text)
+            if heading and p.get("title") and heading != p["title"]:
+                errors.append(f"{pid} body title '{heading}' != state title '{p['title']}'")
+
     return errors
 
 
@@ -1689,7 +1774,7 @@ def validate_cmd(args: argparse.Namespace) -> None:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)
         raise SystemExit(1)
-    print("Ledger is valid!")
+    print(err_msg("ledger_valid"))
 
 
 def status_cmd(args: argparse.Namespace) -> None:
@@ -1750,7 +1835,7 @@ def list_cmd(args: argparse.Namespace) -> None:
                 continue
             items.append(ledger_summary(ledger, state))
     if not items:
-        print(f"No ledgers found under {root}")
+        print(err_msg("no_ledgers_found", root=root))
         return
     for item in sorted(items, key=lambda row: row.get("updated_at") or "", reverse=True):
         marker = "*" if item.get("ledger_id") == active_id else " "
@@ -1765,6 +1850,124 @@ def use_cmd(args: argparse.Namespace) -> None:
         raise SystemExit(f"Unknown ledger under {root}: {ledger_id_value}")
     update_workspace_index_for_ledger(ledger, set_active=True)
     print(f"active_ledger_id={ledger_id_value}")
+
+
+def archive_cmd(args: argparse.Namespace) -> None:
+    import shutil
+    root = Path(args.dir)
+    ledger_id_value = validate_ledger_id(args.ledger_id)
+    ledger = root / ledger_id_value
+    if not (ledger / "state.json").exists():
+        raise SystemExit(err_msg("unknown_ledger", root=root, id=ledger_id_value))
+    archive_dir = root / "archive"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    dest = archive_dir / ledger_id_value
+    if dest.exists():
+        raise SystemExit(f"Archive destination already exists: {dest}")
+    shutil.move(str(ledger), str(dest))
+    index = load_workspace_index(root)
+    index["ledgers"] = [item for item in index.get("ledgers", []) if item.get("ledger_id") != ledger_id_value]
+    if index.get("active_ledger_id") == ledger_id_value:
+        index["active_ledger_id"] = None
+    save_workspace_index(root, index)
+    print(f"archived {ledger_id_value} -> {dest}")
+
+
+def delete_cmd(args: argparse.Namespace) -> None:
+    import shutil
+    root = Path(args.dir)
+    ledger_id_value = validate_ledger_id(args.ledger_id)
+    ledger = root / ledger_id_value
+    if not (ledger / "state.json").exists():
+        raise SystemExit(err_msg("unknown_ledger", root=root, id=ledger_id_value))
+    if not args.force:
+        raise SystemExit(f"Use --force to confirm deletion of {ledger_id_value}")
+    shutil.rmtree(str(ledger))
+    index = load_workspace_index(root)
+    index["ledgers"] = [item for item in index.get("ledgers", []) if item.get("ledger_id") != ledger_id_value]
+    if index.get("active_ledger_id") == ledger_id_value:
+        index["active_ledger_id"] = None
+    save_workspace_index(root, index)
+    print(f"deleted {ledger_id_value}")
+
+
+def undo_cmd(args: argparse.Namespace) -> None:
+    ledger = resolve_ledger(args.ledger)
+    events_path = ledger / "events.jsonl"
+    if not events_path.exists():
+        raise SystemExit("No events to undo")
+    lines = events_path.read_text(encoding="utf-8").strip().split("\n")
+    if not lines or lines == [""]:
+        raise SystemExit("No events to undo")
+    last_event = json.loads(lines[-1])
+    remaining = lines[:-1]
+    if remaining:
+        events_path.write_text("\n".join(remaining) + "\n", encoding="utf-8")
+    else:
+        events_path.write_text("", encoding="utf-8")
+    print(f"undone event: {last_event.get('id')} type={last_event.get('type')}")
+    print("Warning: state.json was NOT reverted; only the event log was trimmed. Manual state repair may be needed.")
+
+
+def set_effort_cmd(args: argparse.Namespace) -> None:
+    ledger = resolve_ledger(args.ledger)
+    with locked_state(ledger) as state:
+        old = state.get("effort", "medium")
+        state["effort"] = args.effort
+        append_event(ledger, state, "effort_changed", {"from": old, "to": args.effort})
+    print(f"effort: {old} -> {args.effort}")
+
+
+def purge_events_cmd(args: argparse.Namespace) -> None:
+    ledger = resolve_ledger(args.ledger)
+    events_path = ledger / "events.jsonl"
+    if not events_path.exists():
+        print("No events file found")
+        return
+    line_count = len(events_path.read_text(encoding="utf-8").strip().split("\n"))
+    if args.keep > 0:
+        lines = events_path.read_text(encoding="utf-8").strip().split("\n")
+        kept = lines[-args.keep:]
+        events_path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+        purged = max(0, line_count - args.keep)
+    else:
+        events_path.write_text("", encoding="utf-8")
+        purged = line_count
+    print(f"purged {purged} events, kept {min(args.keep, line_count)}")
+
+
+def batch_next_cmd(args: argparse.Namespace) -> None:
+    ledger = resolve_ledger(args.ledger)
+    state = load_state(ledger)
+    effort = state.get("effort", "medium")
+    language = state.get("language", "en")
+    problems = state["problems"]
+    open_problems = [p for p in problems.values() if is_open_problem(p)]
+    if not open_problems:
+        print("[]" if args.json else "No open problems")
+        return
+    runnable = [p for p in open_problems if is_runnable_frontier_problem(state, p)]
+    if not runnable:
+        print("[]" if args.json else "No runnable frontier problems")
+        return
+    items = []
+    for problem in runnable:
+        action, reason = next_action_for_problem(state, problem)
+        ticket = primary_ticket(state, problem)
+        item = {
+            "problem_id": problem["id"],
+            "title": problem["title"],
+            "problem_status": problem["status"],
+            "ticket_id": ticket["id"] if ticket else None,
+            "next_action": action,
+            "reason": reason,
+        }
+        items.append(item)
+    if args.json:
+        print(json.dumps(items, ensure_ascii=False, sort_keys=True))
+    else:
+        for item in items:
+            print(f"{item['problem_id']}: {item['next_action']} ({item['reason']})")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1875,6 +2078,36 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("ledger_id")
     p.add_argument("--dir", default=".complex-problems")
     p.set_defaults(func=use_cmd)
+
+    p = sub.add_parser("archive", help="Move a ledger to the archive directory.")
+    p.add_argument("ledger_id")
+    p.add_argument("--dir", default=".complex-problems")
+    p.set_defaults(func=archive_cmd)
+
+    p = sub.add_parser("delete", help="Permanently delete a ledger.")
+    p.add_argument("ledger_id")
+    p.add_argument("--dir", default=".complex-problems")
+    p.add_argument("--force", action="store_true", help="Confirm deletion")
+    p.set_defaults(func=delete_cmd)
+
+    p = sub.add_parser("undo", help="Remove the last event from the event log.")
+    p.add_argument("--ledger")
+    p.set_defaults(func=undo_cmd)
+
+    p = sub.add_parser("set-effort", help="Change the effort level of the active ledger.")
+    p.add_argument("effort", choices=sorted(EFFORT_LEVELS))
+    p.add_argument("--ledger")
+    p.set_defaults(func=set_effort_cmd)
+
+    p = sub.add_parser("purge-events", help="Purge old events from the event log.")
+    p.add_argument("--ledger")
+    p.add_argument("--keep", type=int, default=0, help="Number of recent events to keep")
+    p.set_defaults(func=purge_events_cmd)
+
+    p = sub.add_parser("batch-next", help="List all runnable frontier problems and their next actions.")
+    p.add_argument("--ledger")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=batch_next_cmd)
 
     return parser
 

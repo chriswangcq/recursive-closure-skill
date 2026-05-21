@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// ── Imports and constants ──
 import fs from "node:fs";
 import path from "node:path";
 import http from "node:http";
@@ -41,6 +42,8 @@ Options:
   --help, -h           Show this help`);
 }
 
+// ── Utility functions ──
+
 function readJson(file) {
   return JSON.parse(fs.readFileSync(file, "utf8"));
 }
@@ -78,6 +81,8 @@ function pick(object, keys) {
   }
   return picked;
 }
+
+// ── Data normalization ──
 
 function normalizeProblem(problem) {
   return pick(problem, [
@@ -176,11 +181,28 @@ function readEventsJsonl(ledgerPath) {
   } catch { return []; }
 }
 
+// ── Data collection and ledger summarization ──
+
+function readBodyPreview(ledgerPath, bodyPath, maxChars = 2000) {
+  if (!bodyPath) return "";
+  const fullPath = path.join(ledgerPath, bodyPath);
+  if (!fs.existsSync(fullPath)) return "";
+  try {
+    const content = fs.readFileSync(fullPath, "utf8");
+    return content.length > maxChars ? content.slice(0, maxChars) + "\n…(truncated)" : content;
+  } catch { return ""; }
+}
+
 function summarizeLedger(state, ledgerPath) {
   const problems = Object.values(state.problems || {}).map(normalizeProblem);
   const tickets = Object.values(state.tickets || {}).map(normalizeTicket);
   const results = Object.values(state.results || {}).map(normalizeResult);
   const checks = Object.values(state.checks || {}).map(normalizeCheck);
+  for (const entity of [...problems, ...tickets, ...results, ...checks]) {
+    if (entity.body_path) {
+      entity.body_preview = readBodyPreview(ledgerPath, entity.body_path);
+    }
+  }
   const events = readEventsJsonl(ledgerPath);
   const root = state.problems?.[state.root_id] || problems[0] || {};
   const updatedAt = state.updated_at || latestTimestamp([...problems, ...tickets, ...results, ...checks, ...events]);
@@ -301,6 +323,8 @@ function collectDashboardData(rootDir, ledgerDir, outFile) {
     ledgers,
   };
 }
+
+// ── HTML rendering (self-contained dashboard with inline CSS/JS) ──
 
 function renderHtml(data) {
   const json = JSON.stringify(data).replace(/</g, "\\u003c").replace(/`/g, "\\u0060").replace(/\$\{/g, "\\u0024{");
@@ -836,6 +860,15 @@ function renderHtml(data) {
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }
     }
+    @media print {
+      .topbar, .sidebar, .toolbar, .view-tabs, #graphContainer, .theme-toggle { display: none !important; }
+      .layout { display: block !important; height: auto !important; }
+      .main { overflow: visible !important; }
+      .details { overflow: visible !important; max-height: none !important; }
+      .tree-node { page-break-inside: avoid; }
+      body { background: white; color: black; font-size: 11px; }
+      .badge { border: 1px solid #999; }
+    }
   </style>
 </head>
 <body>
@@ -860,6 +893,7 @@ function renderHtml(data) {
         </button>
         <button id="expandAll" type="button">Expand</button>
         <button id="collapseAll" type="button">Collapse</button>
+        <button id="exportJson" type="button">Export JSON</button>
       </div>
     </header>
     <div class="layout">
@@ -1180,6 +1214,9 @@ function renderHtml(data) {
         }
       }
       html += '<p class="footer-note">Body links open the Markdown source from the ledger package.</p>';
+      if (entity.body_preview) {
+        html += '<section class="detail-section"><h3>Body Preview</h3><pre class="body-preview" style="max-height:400px;overflow:auto;background:var(--panel-2);border:1px solid var(--line);border-radius:6px;padding:12px;font-size:12px;white-space:pre-wrap;word-break:break-word;font-family:var(--mono)">' + escapeHtml(entity.body_preview) + '</pre></section>';
+      }
       return html;
     }
 
@@ -1245,6 +1282,51 @@ function renderHtml(data) {
       state.toggledNodes.clear();
       state.forceOpen = false;
       render();
+    });
+
+    // Keyboard navigation
+    document.addEventListener("keydown", (event) => {
+      if (event.target.tagName === "INPUT" || event.target.tagName === "SELECT" || event.target.tagName === "TEXTAREA") return;
+      const rows = Array.from(document.querySelectorAll("[data-entity-id]"));
+      if (!rows.length) return;
+      const currentIdx = rows.findIndex((r) => r.classList.contains("is-selected"));
+      if (event.key === "ArrowDown" || event.key === "j") {
+        event.preventDefault();
+        const nextIdx = currentIdx < rows.length - 1 ? currentIdx + 1 : 0;
+        const row = rows[nextIdx];
+        state.selectedEntity = { type: row.dataset.entityType, id: row.dataset.entityId };
+        render();
+        row.scrollIntoView({ block: "nearest" });
+      } else if (event.key === "ArrowUp" || event.key === "k") {
+        event.preventDefault();
+        const prevIdx = currentIdx > 0 ? currentIdx - 1 : rows.length - 1;
+        const row = rows[prevIdx];
+        state.selectedEntity = { type: row.dataset.entityType, id: row.dataset.entityId };
+        render();
+        row.scrollIntoView({ block: "nearest" });
+      } else if (event.key === "Enter") {
+        const selected = rows[currentIdx];
+        if (selected) {
+          const details = selected.closest("details");
+          if (details) details.open = !details.open;
+        }
+      } else if (event.key === "/") {
+        event.preventDefault();
+        byId("search").focus();
+      }
+    });
+
+    // Export JSON
+    byId("exportJson").addEventListener("click", () => {
+      const ledger = selectedLedger();
+      if (!ledger) return;
+      const blob = new Blob([JSON.stringify(ledger, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = (ledger.ledger_id || "ledger") + ".json";
+      a.click();
+      URL.revokeObjectURL(url);
     });
 
     // View tabs
@@ -1316,7 +1398,15 @@ function renderHtml(data) {
 
       const link = g.append("g").selectAll("line").data(links).join("line").attr("class", "graph-link").attr("stroke-width", 1.5);
       const node = g.append("g").selectAll("g").data(nodes).join("g").attr("class", "graph-node");
-      node.append("circle").attr("r", (d) => typeRadius[d.type] || 6).attr("fill", (d) => statusColor(d.status)).attr("stroke", "var(--panel)").attr("stroke-width", 1.5);
+      node.append("circle").attr("r", (d) => typeRadius[d.type] || 6).attr("fill", (d) => statusColor(d.status)).attr("stroke", (d) => {
+        const q = normalizeText(state.query);
+        if (q && normalizeText(JSON.stringify(d.entity)).includes(q)) return "#f59e0b";
+        return "var(--panel)";
+      }).attr("stroke-width", (d) => {
+        const q = normalizeText(state.query);
+        if (q && normalizeText(JSON.stringify(d.entity)).includes(q)) return 3;
+        return 1.5;
+      });
       node.append("text").attr("class", "graph-label").attr("dy", -12).attr("text-anchor", "middle").text((d) => d.label);
 
       const tooltip = byId("graphTooltip");
@@ -1357,7 +1447,8 @@ function renderHtml(data) {
 
     render();
   </script>
-  <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js" async></script>
+  <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js" async
+    onerror="document.getElementById('graphContainer').innerHTML='<div class=\\'empty\\'>D3 library failed to load. Graph view requires an internet connection or a local D3 installation.</div>';"></script>
   <script>
     (function() {
       var delay = 1000;
@@ -1378,6 +1469,8 @@ function renderHtml(data) {
 </html>
 `;
 }
+
+// ── WebSocket server (RFC 6455 manual handshake) ──
 
 const WS_GUID = "258EAFA5-E914-47DA-95CA-5AB5DC525B27";
 
@@ -1400,8 +1493,17 @@ function createWsServer(httpServer) {
   function sendFrame(socket, text) {
     const payload = Buffer.from(text, "utf8");
     const header = [0x81];
-    if (payload.length < 126) header.push(payload.length);
-    else header.push(126, (payload.length >> 8) & 0xff, payload.length & 0xff);
+    if (payload.length < 126) {
+      header.push(payload.length);
+    } else if (payload.length < 65536) {
+      header.push(126, (payload.length >> 8) & 0xff, payload.length & 0xff);
+    } else {
+      header.push(127, 0, 0, 0, 0,
+        (payload.length >> 24) & 0xff,
+        (payload.length >> 16) & 0xff,
+        (payload.length >> 8) & 0xff,
+        payload.length & 0xff);
+    }
     socket.write(Buffer.concat([Buffer.from(header), payload]));
   }
 
@@ -1412,6 +1514,8 @@ function createWsServer(httpServer) {
     get clientCount() { return clients.size; },
   };
 }
+
+// ── HTTP server with file watching and live reload ──
 
 function openBrowser(url) {
   const cmd = process.platform === "darwin" ? "open" : "xdg-open";
